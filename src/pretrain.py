@@ -62,19 +62,52 @@ def pretrain_contrastive(
     train_dataset = MedicalVQADataset(split='train')
     val_dataset = MedicalVQADataset(split='validation')
     
-    # Create data loaders
+    # Create data loaders with a custom collate function to handle PIL images
+    def collate_fn(batch):
+        # Filter out any None values
+        batch = [item for item in batch if item is not None]
+        if not batch:
+            return {}
+            
+        # Create a batch dictionary
+        batch_dict = {
+            'image': torch.stack([item['image'] for item in batch]),
+            'question_ids': torch.stack([item['question_ids'] for item in batch]),
+            'question_mask': torch.stack([item['question_mask'] for item in batch]),
+            'is_yes_no': torch.tensor([item['is_yes_no'] for item in batch]),
+        }
+        
+        # Handle answers based on question type
+        answers = []
+        for item in batch:
+            answers.append(item['answer'])
+        
+        # Convert answers to tensor
+        if all(isinstance(ans, int) for ans in answers):
+            batch_dict['answer'] = torch.tensor(answers)
+        elif all(isinstance(ans, torch.Tensor) for ans in answers):
+            batch_dict['answer'] = torch.stack(answers)
+        else:
+            # Mixed types - handle separately
+            batch_dict['answer'] = answers
+            
+        return batch_dict
+    
+    # Create data loaders with custom collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4
+        num_workers=4,
+        collate_fn=collate_fn
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4
+        num_workers=4,
+        collate_fn=collate_fn
     )
     
     # Optimizer
@@ -98,6 +131,10 @@ def pretrain_contrastive(
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for batch in progress_bar:
+            # Skip empty batches
+            if not batch:
+                continue
+                
             # Move batch to device
             images = batch['image'].to(device)
             question_ids = batch['question_ids'].to(device)
@@ -128,6 +165,10 @@ def pretrain_contrastive(
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
+                # Skip empty batches
+                if not batch:
+                    continue
+                    
                 # Move batch to device
                 images = batch['image'].to(device)
                 question_ids = batch['question_ids'].to(device)
@@ -145,8 +186,8 @@ def pretrain_contrastive(
                 val_loss += loss.item()
         
         # Print epoch results
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+        avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0
+        avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
         print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
         # Save best model

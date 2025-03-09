@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
+from transformers import BlipModel, BertModel, BioGptModel, BertTokenizer
 import torch.nn.functional as F
-from transformers import BertModel, BioGptModel, BlipModel
 
 class ExpertLayer(nn.Module):
     def __init__(self, input_dim, output_dim):
@@ -36,7 +36,8 @@ class MixtureOfExperts(nn.Module):
         
         # Apply experts
         batch_size = x.size(0)
-        expert_outputs = torch.zeros(batch_size, x.size(1), device=x.device)
+        # Initialize expert_outputs with correct dimensions
+        expert_outputs = torch.zeros(batch_size, x.size(1) // 2, device=x.device)
         
         for i in range(self.k):
             # For each position in top-k
@@ -76,6 +77,7 @@ class KVCache:
         return self.keys, self.values
 
 class MedicalVQAModel(nn.Module):
+    # In the MedicalVQAModel class, we need to add a projection layer to match dimensions
     def __init__(self, temperature=0.07, num_experts=4, vocab_size=None):
         super().__init__()
         # Load pretrained models
@@ -102,11 +104,14 @@ class MedicalVQAModel(nn.Module):
         self.visual_projection = nn.Linear(768, 768)
         self.question_projection = nn.Linear(768, 768)
         
-        # Mixture of Experts for decoder
+        # Mixture of Experts for decoder - input is concatenated features (768*2)
         self.moe = MixtureOfExperts(768 * 2, 768, num_experts=num_experts)
         
+        # Add projection layer to match BioGPT embedding dimension (768 -> 1024)
+        self.biogpt_projection = nn.Linear(768, 1024)
+        
         # Output generation layer
-        self.output_projection = nn.Linear(768, vocab_size)
+        self.output_projection = nn.Linear(1024, vocab_size)  # Updated to match BioGPT hidden size
         
         # Contrastive learning components
         self.image_projection_cl = nn.Linear(768, 256)
@@ -123,18 +128,45 @@ class MedicalVQAModel(nn.Module):
         self.medical_term_ids = None  # Will be populated with medical term token IDs
         self.medical_boost_factor = 1.3
 
-    def forward(self, image, question, mode='vqa', past_tokens=None):
-        # Process image through BLIP's ViT
-        vision_outputs = self.blip.vision_model(image)
-        vision_features = vision_outputs.last_hidden_state.mean(dim=1)  # Pool visual features
+    # In the forward method, update the BioGPT input handling
+    def forward(self, image, question, mode='default', past_tokens=None):
+        """
+        Forward pass for the model
         
-        # Process question through BERT
-        question_outputs = self.bert(question)
-        question_features = question_outputs.last_hidden_state[:, 0, :]  # Use [CLS] token
+        Args:
+            image: Image tensor
+            question: Dictionary with 'input_ids' and 'attention_mask' for text
+            mode: 'default' for QA, 'contrastive' for pretraining
+            past_tokens: Optional past tokens for generation
+        """
+        batch_size = image.size(0)
+        
+        # Process image through BLIP vision encoder with memory optimization
+        with torch.cuda.amp.autocast():  # Use mixed precision
+            vision_outputs = self.blip.vision_model(image)
+            vision_features = vision_outputs.last_hidden_state.mean(dim=1)  # Pool visual features
+            
+            # Free up memory
+            del vision_outputs
+            torch.cuda.empty_cache()
+            
+            # Process question through BERT
+            input_ids = question['input_ids']
+            attention_mask = question['attention_mask']
+            
+            question_outputs = self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            question_features = question_outputs.last_hidden_state[:, 0, :]  # Use [CLS] token
+            
+            # Free up memory
+            del question_outputs
+            torch.cuda.empty_cache()
         
         # For contrastive learning mode
         if mode == 'contrastive':
-            # Project features to contrastive space
+            # Project features to the same space
             image_embeddings = self.image_projection_cl(vision_features)
             text_embeddings = self.text_projection_cl(question_features)
             
@@ -165,6 +197,10 @@ class MedicalVQAModel(nn.Module):
         # Handle open-ended questions using MoE
         moe_features = self.moe(combined_features)
         
+        # Free up memory
+        del vision_features, question_features, vision_projected, question_projected, combined_features
+        torch.cuda.empty_cache()
+        
         # Use KV Cache for efficient generation
         if past_tokens is not None:
             # Apply repetition penalty
@@ -186,7 +222,11 @@ class MedicalVQAModel(nn.Module):
             }
         else:
             # Standard generation
-            biogpt_outputs = self.biogpt(inputs_embeds=moe_features.unsqueeze(1))
+            # Project MoE features to match BioGPT embedding dimension
+            projected_features = self.biogpt_projection(moe_features)
+            
+            # Pass through BioGPT
+            biogpt_outputs = self.biogpt(inputs_embeds=projected_features.unsqueeze(1))
             open_ended_logits = self.output_projection(biogpt_outputs.last_hidden_state)
             
             return {
