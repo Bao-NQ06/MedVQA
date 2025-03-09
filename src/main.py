@@ -233,65 +233,104 @@ def test_model(model, test_loader, device):
                     open_ended_indices = batch['open_ended_indices'].to(device, non_blocking=True)
                 
                 # Use mixed precision for forward pass
-                with torch.amp.autocast('cuda'):
-                    # Forward pass
+                with torch.amp.autocast('cuda'):  # Fixed deprecated warning
+                    # Forward pass - enable text generation for open-ended questions
                     outputs = model(
                         images, 
-                        {'input_ids': question_ids, 'attention_mask': question_mask}
+                        {'input_ids': question_ids, 'attention_mask': question_mask},
+                        generate_text=True,  # Enable text generation
+                        max_length=20  # Set reasonable max length for medical answers
                     )
                 
                 # Process yes/no questions
                 if 'yes_no_indices' in batch and len(batch['yes_no_indices']) > 0 and 'yes_no_logits' in outputs:
                     # Get predictions for yes/no questions
-                    yes_no_logits = outputs['yes_no_logits'][yes_no_indices]
+                    yes_no_indices_cpu = yes_no_indices.cpu().numpy()
+                    yes_no_logits = outputs['yes_no_logits']
                     
-                    # Handle different output shapes
-                    if yes_no_logits.size(-1) == 2:  # Binary classification with 2 outputs
-                        batch_yes_no_preds = torch.argmax(yes_no_logits, dim=1).cpu().numpy()
-                    else:  # Single output
-                        batch_yes_no_preds = (torch.sigmoid(yes_no_logits) > 0.5).int().cpu().numpy()
-                    
-                    # Store predictions and labels
-                    yes_no_preds.extend(batch_yes_no_preds)
-                    yes_no_labels.extend(yes_no_answers.cpu().numpy())
+                    # Use indexing that works with tensors
+                    if len(yes_no_indices_cpu) > 0:
+                        selected_logits = yes_no_logits[yes_no_indices]
+                        
+                        # Handle different output shapes - match the logic in calculate_loss
+                        if selected_logits.size(-1) == 2:  # Binary classification with 2 outputs
+                            batch_yes_no_preds = torch.argmax(selected_logits, dim=1).cpu().numpy()
+                        else:  # Single output
+                            batch_yes_no_preds = (torch.sigmoid(selected_logits) > 0.5).int().cpu().numpy()
+                        
+                        # Store predictions and labels
+                        yes_no_preds.extend(batch_yes_no_preds.tolist())  # Convert to Python list
+                        yes_no_labels.extend(yes_no_answers.cpu().numpy().tolist())  # Convert to Python list
                 
-                # Process open-ended questions
+                # Process open-ended questions - align with calculate_loss logic
                 if 'open_ended_indices' in batch and len(batch['open_ended_indices']) > 0 and 'open_ended_logits' in outputs:
                     # Get predictions for open-ended questions
-                    open_ended_logits = outputs['open_ended_logits'][open_ended_indices]
+                    open_ended_indices_cpu = open_ended_indices.cpu().numpy()
+                    open_ended_logits = outputs['open_ended_logits']
                     
-                    # Handle different output shapes
-                    if len(open_ended_logits.shape) == 2:  # [batch_size, vocab_size]
-                        batch_open_ended_preds = torch.argmax(open_ended_logits, dim=1).unsqueeze(1).cpu().numpy()
-                    else:  # [batch_size, seq_len, vocab_size]
-                        batch_open_ended_preds = torch.argmax(open_ended_logits, dim=-1).cpu().numpy()
-                    
-                    # Convert token IDs to text
-                    for i, pred_ids in enumerate(batch_open_ended_preds):
-                        # Filter out padding and special tokens
-                        pred_ids = [id for id in pred_ids if id > 0]
-                        if not pred_ids:
-                            pred_text = ""
-                        else:
-                            # Convert prediction to text
-                            pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+                    # Use indexing that works with tensors
+                    if len(open_ended_indices_cpu) > 0:
+                        selected_logits = open_ended_logits[open_ended_indices]
                         
-                        open_ended_preds.append(pred_text)
+                        # Handle different output shapes
+                        if len(selected_logits.shape) == 2:  # [batch_size, vocab_size]
+                            batch_open_ended_preds = torch.argmax(selected_logits, dim=1).unsqueeze(1).cpu().numpy()
+                        else:  # [batch_size, seq_len, vocab_size]
+                            batch_open_ended_preds = torch.argmax(selected_logits, dim=-1).cpu().numpy()
                         
-                        # Get ground truth answer
-                        if isinstance(batch['open_ended_answers'], list):
-                            # Text answers
-                            open_ended_labels.append(batch['open_ended_answers'][i])
-                        else:
-                            # Token ID answers
-                            answer_ids = batch['open_ended_answers'][i].cpu().numpy()
-                            # Filter out padding and special tokens
-                            answer_ids = [id for id in answer_ids if id > 0]
-                            if not answer_ids:
-                                answer_text = ""
+                        # Convert token IDs to text
+                        for i, pred_ids in enumerate(batch_open_ended_preds):
+                            # Filter out padding and special tokens - fixed conversion issue
+                            valid_ids = []
+                            for id_val in pred_ids:
+                                # Handle scalar or array values
+                                if np.isscalar(id_val):
+                                    if id_val > 0:
+                                        valid_ids.append(int(id_val))
+                                else:
+                                    # For array values, check each item
+                                    for item in id_val.flatten():
+                                        if item > 0:
+                                            valid_ids.append(int(item))
+                            
+                            if not valid_ids:
+                                pred_text = ""
                             else:
-                                answer_text = tokenizer.decode(answer_ids, skip_special_tokens=True)
-                            open_ended_labels.append(answer_text)
+                                # Convert prediction to text
+                                pred_text = tokenizer.decode(valid_ids, skip_special_tokens=True)
+                            
+                            # Ensure we have a non-empty prediction
+                            if not pred_text.strip():
+                                # Fallback to a simple prediction based on the image and question features
+                                pred_text = "Unable to generate specific answer"
+                            
+                            open_ended_preds.append(pred_text)
+                            
+                            # Get ground truth answer
+                            if isinstance(open_ended_answers, list):
+                                # Text answers
+                                open_ended_labels.append(open_ended_answers[i])
+                            else:
+                                # Token ID answers - fixed conversion issue
+                                answer_ids = open_ended_answers[i].cpu().numpy()
+                                valid_answer_ids = []
+                                
+                                # Handle different array shapes
+                                for id_val in answer_ids:
+                                    if np.isscalar(id_val):
+                                        if id_val > 0:
+                                            valid_answer_ids.append(int(id_val))
+                                    else:
+                                        # For array values, check each item
+                                        for item in id_val.flatten():
+                                            if item > 0:
+                                                valid_answer_ids.append(int(item))
+                                
+                                if not valid_answer_ids:
+                                    answer_text = ""
+                                else:
+                                    answer_text = tokenizer.decode(valid_answer_ids, skip_special_tokens=True)
+                                open_ended_labels.append(answer_text)
                 
                 # Display progress
                 progress_bar.set_postfix({
@@ -314,6 +353,8 @@ def test_model(model, test_loader, device):
                     
             except Exception as e:
                 print(f"Error in test batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
     
     # Calculate metrics
@@ -378,9 +419,9 @@ def test_model(model, test_loader, device):
             print(f"Error calculating ROUGE score: {e}")
     
     # Save predictions for visualization
-    if open_ended_preds:
+    if len(open_ended_preds) > 0:
         results['open_ended_predictions'] = list(zip(open_ended_preds, open_ended_labels))
-    if yes_no_preds:
+    if len(yes_no_preds) > 0:
         results['yes_no_predictions'] = list(zip(yes_no_preds, yes_no_labels))
     
     return results

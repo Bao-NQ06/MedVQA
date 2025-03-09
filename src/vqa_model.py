@@ -36,15 +36,14 @@ class MixtureOfExperts(nn.Module):
         
         # Apply experts
         batch_size = x.size(0)
-        # Initialize expert_outputs with correct dimensions
-        expert_outputs = torch.zeros(batch_size, x.size(1) // 2, device=x.device)
+        expert_outputs = torch.zeros(batch_size, self.experts[0](x[0:1]).size(1), device=x.device)
         
         for i in range(self.k):
             # For each position in top-k
             for j in range(batch_size):
                 expert_idx = top_k_indices[j, i]
-                expert_output = self.experts[expert_idx](x[j].unsqueeze(0)).squeeze(0)
-                expert_outputs[j] += top_k_weights[j, i] * expert_output
+                expert_output = self.experts[expert_idx](x[j:j+1])
+                expert_outputs[j] += top_k_weights[j, i] * expert_output.squeeze(0)
                 
         return expert_outputs
 
@@ -129,7 +128,7 @@ class MedicalVQAModel(nn.Module):
         self.medical_boost_factor = 1.3
 
     # In the forward method, update the BioGPT input handling
-    def forward(self, image, question, mode='default', past_tokens=None):
+    def forward(self, image, question, mode='default', past_tokens=None, generate_text=False, max_length=50):
         """
         Forward pass for the model
         
@@ -138,6 +137,8 @@ class MedicalVQAModel(nn.Module):
             question: Dictionary with 'input_ids' and 'attention_mask' for text
             mode: 'default' for QA, 'contrastive' for pretraining
             past_tokens: Optional past tokens for generation
+            generate_text: Whether to generate text for open-ended questions
+            max_length: Maximum length of generated text
         """
         batch_size = image.size(0)
         
@@ -225,9 +226,46 @@ class MedicalVQAModel(nn.Module):
             # Project MoE features to match BioGPT embedding dimension
             projected_features = self.biogpt_projection(moe_features)
             
-            # Pass through BioGPT
-            biogpt_outputs = self.biogpt(inputs_embeds=projected_features.unsqueeze(1))
-            open_ended_logits = self.output_projection(biogpt_outputs.last_hidden_state)
+            # For text generation mode, generate a sequence of tokens
+            if generate_text:
+                # Initialize with projected features as the first token embedding
+                current_input = projected_features.unsqueeze(1)  # [batch_size, 1, hidden_size]
+                generated_tokens = []
+                
+                # Generate tokens auto-regressively
+                for i in range(max_length):
+                    # Pass through BioGPT
+                    biogpt_outputs = self.biogpt(inputs_embeds=current_input)
+                    next_token_logits = self.output_projection(biogpt_outputs.last_hidden_state[:, -1, :])
+                    
+                    # Apply temperature and sampling
+                    next_token = torch.argmax(next_token_logits, dim=-1)
+                    generated_tokens.append(next_token)
+                    
+                    # Prepare next input - get token embeddings from BioGPT
+                    next_token_embedding = self.biogpt.get_input_embeddings()(next_token).unsqueeze(1)
+                    current_input = torch.cat([current_input, next_token_embedding], dim=1) if i == 0 else next_token_embedding
+                
+                # Stack generated tokens
+                generated_tokens = torch.stack(generated_tokens, dim=1)  # [batch_size, seq_len]
+                
+                # Create logits for the generated sequence
+                open_ended_logits = torch.zeros(
+                    batch_size, 
+                    generated_tokens.size(1), 
+                    self.biogpt.config.vocab_size, 
+                    device=device
+                )
+                
+                # Fill in the logits with one-hot encodings of the generated tokens
+                for i in range(batch_size):
+                    for j in range(generated_tokens.size(1)):
+                        token_idx = generated_tokens[i, j].item()
+                        open_ended_logits[i, j, token_idx] = 1.0
+            else:
+                # Single-step generation (original behavior)
+                biogpt_outputs = self.biogpt(inputs_embeds=projected_features.unsqueeze(1))
+                open_ended_logits = self.output_projection(biogpt_outputs.last_hidden_state)
             
             return {
                 'question_type': question_type,
